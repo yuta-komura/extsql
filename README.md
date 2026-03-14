@@ -16,7 +16,7 @@ node extsql.js C:\\work\\project\\src
 
 ## 出力
 
-- 出力ファイル: `insert_extsql.sql`
+`insert_extsql.sql`
 
 ## テーブル
 
