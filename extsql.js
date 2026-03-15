@@ -70,7 +70,7 @@ function main() {
         stats.maxSqlBytes = sqlBytes;
       }
 
-      const clobExprInfo = makeOracleClobExpression(sqlText);
+      const clobExprInfo = makeOracleClobExpressionByLine(sqlText);
       if (clobExprInfo.chunkCount > 1) {
         stats.clobChunkedBlocks++;
       }
@@ -350,7 +350,7 @@ function escapeOracleString(s) {
   return s.replace(/'/g, "''");
 }
 
-function makeOracleClobExpression(text) {
+function makeOracleClobExpressionByLine(text) {
   if (text.length === 0) {
     return {
       expr: "EMPTY_CLOB()",
@@ -358,26 +358,44 @@ function makeOracleClobExpression(text) {
     };
   }
 
-  const chunks = splitTextByUtf8Bytes(text, ORACLE_LITERAL_SAFE_BYTES);
+  const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
   const parts = [];
+  let chunkCount = 0;
 
-  for (let i = 0; i < chunks.length; i++) {
-    const q = makeOracleQQuote(chunks[i]);
+  for (let i = 0; i < lines.length; i++) {
+    const lineParts = splitTextByUtf8Bytes(lines[i], ORACLE_LITERAL_SAFE_BYTES);
 
-    if (i === 0) {
-      parts.push("TO_CLOB(" + q + ")");
-    } else {
-      parts.push("|| " + q);
+    for (let j = 0; j < lineParts.length; j++) {
+      const q = makeOracleQQuote(lineParts[j]);
+
+      if (parts.length === 0) {
+        parts.push("TO_CLOB(" + q + ")");
+      } else {
+        parts.push("|| " + q);
+      }
+      chunkCount++;
+    }
+
+    if (i < lines.length - 1) {
+      if (parts.length === 0) {
+        parts.push("TO_CLOB(CHR(10))");
+      } else {
+        parts.push("|| CHR(10)");
+      }
     }
   }
 
   return {
     expr: parts.join("\n"),
-    chunkCount: chunks.length,
+    chunkCount,
   };
 }
 
 function splitTextByUtf8Bytes(text, maxBytes) {
+  if (text.length === 0) {
+    return [""];
+  }
+
   const result = [];
   let current = "";
   let currentBytes = 0;
