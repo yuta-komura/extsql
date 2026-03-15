@@ -92,9 +92,6 @@ function main() {
     }
   }
 
-  out.push("COMMIT;");
-  out.push("");
-
   fs.writeFileSync(OUTPUT_FILE, out.join("\n"), "utf8");
 
   console.log("Done.");
