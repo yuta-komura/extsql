@@ -28,3 +28,8 @@ CREATE TABLE SQL_APPEND_EXTRACT (
     SQL_TEXT      CLOB
 );
 ```
+
+## 免責事項
+
+本ツールは Java ソース中の .append(...) 呼び出しから SQL らしき文字列断片を静的に抽出する簡易ツールです。  
+実際にアプリケーションで実行される SQL を 完全に再現するものではありません。
