@@ -28,7 +28,7 @@ function main() {
     totalBlocks: 0,
     totalSqlBytes: 0,
     maxSqlBytes: 0,
-    clobChunkedBlocks: 0,
+    chunkedBlocks: 0,
     skippedReadErrors: 0,
   };
 
@@ -60,19 +60,23 @@ function main() {
 
     for (let i = 0; i < result.blocks.length; i++) {
       const blockNo = i + 1;
-      const blockLines = result.blocks[i];
-      const sqlText = blockLines.join("\n");
-      const sqlBytes = Buffer.byteLength(sqlText, "utf8");
+      const block = result.blocks[i];
 
+      const sqlText = normalizeRecoveredSql(block.fragments);
+      if (!sqlText) {
+        continue;
+      }
+
+      const sqlBytes = Buffer.byteLength(sqlText, "utf8");
       stats.totalBlocks++;
       stats.totalSqlBytes += sqlBytes;
       if (sqlBytes > stats.maxSqlBytes) {
         stats.maxSqlBytes = sqlBytes;
       }
 
-      const clobExprInfo = makeOracleClobExpressionByLine(sqlText);
-      if (clobExprInfo.chunkCount > 1) {
-        stats.clobChunkedBlocks++;
+      const clobInfo = makeOracleClobExpressionOneLine(sqlText);
+      if (clobInfo.chunkCount > 1) {
+        stats.chunkedBlocks++;
       }
 
       out.push(
@@ -82,7 +86,7 @@ function main() {
       );
       out.push("  '" + escapeOracleString(relPath) + "',");
       out.push("  " + blockNo + ",");
-      out.push(indentMultiline(clobExprInfo.expr, "  "));
+      out.push(indentMultiline(clobInfo.expr, "  "));
       out.push(");");
       out.push("");
     }
@@ -98,7 +102,7 @@ function main() {
   console.log("Java files          : " + stats.totalFiles);
   console.log("Matched files       : " + stats.matchedFiles);
   console.log("Blocks              : " + stats.totalBlocks);
-  console.log("Chunked CLOB blocks : " + stats.clobChunkedBlocks);
+  console.log("Chunked blocks      : " + stats.chunkedBlocks);
   console.log("Total SQL bytes     : " + stats.totalSqlBytes);
   console.log("Max SQL bytes       : " + stats.maxSqlBytes);
   console.log("Read errors         : " + stats.skippedReadErrors);
@@ -147,7 +151,7 @@ function extractBlocksFromJava(content) {
   };
 
   const blocks = [];
-  let appendBuffer = [];
+  let currentFragments = [];
   let hasPrepareStatement = false;
 
   for (const rawLine of lines) {
@@ -156,23 +160,36 @@ function extractBlocksFromJava(content) {
     if (containsPrepareStatement(codeLine)) {
       hasPrepareStatement = true;
 
-      if (appendBuffer.length > 0) {
-        blocks.push(appendBuffer.slice());
-        appendBuffer = [];
+      if (currentFragments.length > 0) {
+        blocks.push({ fragments: currentFragments.slice() });
+        currentFragments = [];
       }
       continue;
     }
 
-    if (
-      containsAppendCall(codeLine) &&
-      isLikelySqlAppendLine(rawLine, codeLine)
-    ) {
-      appendBuffer.push(rawLine);
+    if (!containsAppendCall(codeLine)) {
+      continue;
     }
+
+    if (!isLikelySqlAppendLine(rawLine, codeLine)) {
+      continue;
+    }
+
+    const appendArg = extractAppendArgument(rawLine);
+    if (appendArg == null) {
+      continue;
+    }
+
+    const fragment = recoverAppendFragment(appendArg);
+    if (fragment == null) {
+      continue;
+    }
+
+    currentFragments.push(fragment);
   }
 
-  if (appendBuffer.length > 0) {
-    blocks.push(appendBuffer.slice());
+  if (currentFragments.length > 0) {
+    blocks.push({ fragments: currentFragments.slice() });
   }
 
   return {
@@ -342,6 +359,278 @@ function extractAppendReceiver(codeLine) {
   return m ? m[1] : "";
 }
 
+function extractAppendArgument(rawLine) {
+  const appendIndex = rawLine.indexOf(".append(");
+  if (appendIndex < 0) {
+    return null;
+  }
+
+  const openParenIndex = rawLine.indexOf("(", appendIndex);
+  if (openParenIndex < 0) {
+    return null;
+  }
+
+  let i = openParenIndex + 1;
+  let depth = 1;
+  let inString = false;
+  let inChar = false;
+  let escape = false;
+
+  while (i < rawLine.length) {
+    const ch = rawLine[i];
+
+    if (inString) {
+      if (escape) {
+        escape = false;
+      } else if (ch === "\\") {
+        escape = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      i++;
+      continue;
+    }
+
+    if (inChar) {
+      if (escape) {
+        escape = false;
+      } else if (ch === "\\") {
+        escape = true;
+      } else if (ch === "'") {
+        inChar = false;
+      }
+      i++;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      i++;
+      continue;
+    }
+
+    if (ch === "'") {
+      inChar = true;
+      i++;
+      continue;
+    }
+
+    if (ch === "(") {
+      depth++;
+      i++;
+      continue;
+    }
+
+    if (ch === ")") {
+      depth--;
+      if (depth === 0) {
+        return rawLine.substring(openParenIndex + 1, i).trim();
+      }
+      i++;
+      continue;
+    }
+
+    i++;
+  }
+
+  return null;
+}
+
+function recoverAppendFragment(argText) {
+  if (!argText) {
+    return null;
+  }
+
+  const stringLiteral = recoverConcatenatedStringLiteral(argText);
+  if (stringLiteral != null) {
+    return stringLiteral;
+  }
+
+  return "/*dynamic*/";
+}
+
+function recoverConcatenatedStringLiteral(argText) {
+  let i = 0;
+  let result = "";
+  let foundString = false;
+
+  while (i < argText.length) {
+    i = skipSpaces(argText, i);
+    if (i >= argText.length) {
+      break;
+    }
+
+    if (argText[i] !== '"') {
+      return null;
+    }
+
+    const parsed = parseJavaStringLiteral(argText, i);
+    if (!parsed) {
+      return null;
+    }
+
+    result += parsed.value;
+    foundString = true;
+    i = skipSpaces(argText, parsed.nextIndex);
+
+    if (i >= argText.length) {
+      break;
+    }
+
+    if (argText[i] !== "+") {
+      return null;
+    }
+
+    i++;
+  }
+
+  return foundString ? result : null;
+}
+
+function parseJavaStringLiteral(text, startIndex) {
+  if (text[startIndex] !== '"') {
+    return null;
+  }
+
+  let i = startIndex + 1;
+  let out = "";
+
+  while (i < text.length) {
+    const ch = text[i];
+
+    if (ch === '"') {
+      return {
+        value: out,
+        nextIndex: i + 1,
+      };
+    }
+
+    if (ch === "\\") {
+      if (i + 1 >= text.length) {
+        return null;
+      }
+
+      const next = text[i + 1];
+
+      switch (next) {
+        case "n":
+          out += "\n";
+          i += 2;
+          break;
+        case "r":
+          out += "\r";
+          i += 2;
+          break;
+        case "t":
+          out += "\t";
+          i += 2;
+          break;
+        case "b":
+          out += "\b";
+          i += 2;
+          break;
+        case "f":
+          out += "\f";
+          i += 2;
+          break;
+        case "\\":
+          out += "\\";
+          i += 2;
+          break;
+        case '"':
+          out += '"';
+          i += 2;
+          break;
+        case "'":
+          out += "'";
+          i += 2;
+          break;
+        case "u": {
+          if (i + 5 >= text.length) {
+            return null;
+          }
+          const hex = text.substring(i + 2, i + 6);
+          if (!/^[0-9a-fA-F]{4}$/.test(hex)) {
+            return null;
+          }
+          out += String.fromCharCode(parseInt(hex, 16));
+          i += 6;
+          break;
+        }
+        default:
+          if (/[0-7]/.test(next)) {
+            let j = i + 1;
+            let oct = "";
+            let count = 0;
+            while (j < text.length && /[0-7]/.test(text[j]) && count < 3) {
+              oct += text[j];
+              j++;
+              count++;
+            }
+            out += String.fromCharCode(parseInt(oct, 8));
+            i = j;
+            break;
+          }
+          out += next;
+          i += 2;
+          break;
+      }
+
+      continue;
+    }
+
+    out += ch;
+    i++;
+  }
+
+  return null;
+}
+
+function skipSpaces(text, i) {
+  while (i < text.length && /\s/.test(text[i])) {
+    i++;
+  }
+  return i;
+}
+
+function normalizeRecoveredSql(fragments) {
+  if (!fragments || fragments.length === 0) {
+    return "";
+  }
+
+  const normalized = [];
+  let previousWasDynamic = false;
+
+  for (const fragment of fragments) {
+    let s = fragment;
+
+    if (s == null) {
+      continue;
+    }
+
+    s = s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    s = s.replace(/\s+/g, " ").trim();
+
+    if (!s) {
+      continue;
+    }
+
+    if (s === "/*dynamic*/") {
+      if (previousWasDynamic) {
+        continue;
+      }
+      normalized.push(s);
+      previousWasDynamic = true;
+      continue;
+    }
+
+    normalized.push(s);
+    previousWasDynamic = false;
+  }
+
+  return normalized.join(" ").replace(/\s+/g, " ").trim();
+}
+
 function toPosixPath(p) {
   return p.split(path.sep).join("/");
 }
@@ -350,7 +639,7 @@ function escapeOracleString(s) {
   return s.replace(/'/g, "''");
 }
 
-function makeOracleClobExpressionByLine(text) {
+function makeOracleClobExpressionOneLine(text) {
   if (text.length === 0) {
     return {
       expr: "EMPTY_CLOB()",
@@ -358,44 +647,26 @@ function makeOracleClobExpressionByLine(text) {
     };
   }
 
-  const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  const chunks = splitTextByUtf8Bytes(text, ORACLE_LITERAL_SAFE_BYTES);
   const parts = [];
-  let chunkCount = 0;
 
-  for (let i = 0; i < lines.length; i++) {
-    const lineParts = splitTextByUtf8Bytes(lines[i], ORACLE_LITERAL_SAFE_BYTES);
+  for (let i = 0; i < chunks.length; i++) {
+    const q = makeOracleQQuote(chunks[i]);
 
-    for (let j = 0; j < lineParts.length; j++) {
-      const q = makeOracleQQuote(lineParts[j]);
-
-      if (parts.length === 0) {
-        parts.push("TO_CLOB(" + q + ")");
-      } else {
-        parts.push("|| " + q);
-      }
-      chunkCount++;
-    }
-
-    if (i < lines.length - 1) {
-      if (parts.length === 0) {
-        parts.push("TO_CLOB(CHR(10))");
-      } else {
-        parts.push("|| CHR(10)");
-      }
+    if (i === 0) {
+      parts.push("TO_CLOB(" + q + ")");
+    } else {
+      parts.push("|| " + q);
     }
   }
 
   return {
     expr: parts.join("\n"),
-    chunkCount,
+    chunkCount: chunks.length,
   };
 }
 
 function splitTextByUtf8Bytes(text, maxBytes) {
-  if (text.length === 0) {
-    return [""];
-  }
-
   const result = [];
   let current = "";
   let currentBytes = 0;

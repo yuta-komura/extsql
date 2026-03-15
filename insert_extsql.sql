@@ -1,0 +1,67 @@
+INSERT INTO SQL_APPEND_EXTRACT (FILE_PATH, BLOCK_NO, SQL_TEXT) VALUES (
+  'jp/co/aaa/dba/dao/MultiPrepareSample.java',
+  1,
+  TO_CLOB(q'[SELECT COL1 FROM TABLE1]')
+);
+
+INSERT INTO SQL_APPEND_EXTRACT (FILE_PATH, BLOCK_NO, SQL_TEXT) VALUES (
+  'jp/co/aaa/dba/dao/MultiPrepareSample.java',
+  2,
+  TO_CLOB(q'[UPDATE TABLE1 SET COL1 = ?]')
+);
+
+INSERT INTO SQL_APPEND_EXTRACT (FILE_PATH, BLOCK_NO, SQL_TEXT) VALUES (
+  'jp/co/aaa/dba/service/BatExtractionComplexPatternSample.java',
+  1,
+  TO_CLOB(q'[SELECT EMP_ID, EMP_NAME FROM EMPLOYEE WHERE EMP_ID = ?]')
+);
+
+INSERT INTO SQL_APPEND_EXTRACT (FILE_PATH, BLOCK_NO, SQL_TEXT) VALUES (
+  'jp/co/aaa/dba/service/BatExtractionComplexPatternSample.java',
+  2,
+  TO_CLOB(q'[THIS_APPEND_IS_AFTER_PREPARE SO_PREVIOUS_BLOCK_SHOULD_NOT_MATCH SELECT CUSTOMER_ID FROM CUSTOMER WHERE DELETE_FLG = '0']')
+);
+
+INSERT INTO SQL_APPEND_EXTRACT (FILE_PATH, BLOCK_NO, SQL_TEXT) VALUES (
+  'jp/co/aaa/dba/service/BatExtractionComplexPatternSample.java',
+  3,
+  TO_CLOB(q'[SELECT CODE FROM MASTER WHERE DELETE_FLG = '0']')
+);
+
+INSERT INTO SQL_APPEND_EXTRACT (FILE_PATH, BLOCK_NO, SQL_TEXT) VALUES (
+  'jp/co/aaa/dba/service/BatExtractionComplexPatternSample.java',
+  4,
+  TO_CLOB(q'[SELECT TEST_COL FROM TEST_TABLE WHERE 1 = 1 OR TEST_COL = ?]')
+);
+
+INSERT INTO SQL_APPEND_EXTRACT (FILE_PATH, BLOCK_NO, SQL_TEXT) VALUES (
+  'jp/co/aaa/dba/service/BatExtractionTestSample.java',
+  1,
+  TO_CLOB(q'[SELECT EMP_ID, EMP_NAME FROM EMPLOYEE WHERE EMP_ID = ?]')
+);
+
+INSERT INTO SQL_APPEND_EXTRACT (FILE_PATH, BLOCK_NO, SQL_TEXT) VALUES (
+  'jp/co/aaa/dba/service/BatExtractionTestSample.java',
+  2,
+  TO_CLOB(q'[INSERT INTO EMPLOYEE ^(EMP_ID, EMP_NAME^) VALUES ^(?, ?^)]')
+);
+
+INSERT INTO SQL_APPEND_EXTRACT (FILE_PATH, BLOCK_NO, SQL_TEXT) VALUES (
+  'jp/co/aaa/dba/service/BatExtractionTestSample.java',
+  3,
+  TO_CLOB(q'[UPDATE EMPLOYEE SET EMP_NAME = ? WHERE EMP_ID = ?]')
+);
+
+INSERT INTO SQL_APPEND_EXTRACT (FILE_PATH, BLOCK_NO, SQL_TEXT) VALUES (
+  'jp/co/aaa/dba/service/BatExtractionTestSample.java',
+  4,
+  TO_CLOB(q'[THIS_APPEND_IS_AFTER_PREPARE SO_PREVIOUS_BLOCK_SHOULD_NOT_MATCH SELECT DEPT_ID, DEPT_NAME FROM DEPARTMENT WHERE DELETE_FLG = '0']')
+);
+
+INSERT INTO SQL_APPEND_EXTRACT (FILE_PATH, BLOCK_NO, SQL_TEXT) VALUES (
+  'jp/co/aaa/dba/util/LogAppendOnlySample.java',
+  1,
+  TO_CLOB(q'[SELECT ID FROM LOG_TABLE]')
+);
+
+COMMIT;
