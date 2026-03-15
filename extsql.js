@@ -6,42 +6,40 @@ const path = require("path");
 
 const OUTPUT_FILE = "insert_extsql.sql";
 const TARGET_TABLE = "SQL_APPEND_EXTRACT";
+const ORACLE_LITERAL_SAFE_BYTES = 3000;
 
 function main() {
   const rootArg = process.argv[2];
   if (!rootArg) {
-    console.error("Usage: node extract-sql-oracle-insert.js <rootDir>");
+    console.error("Usage: node extsql.js <rootDir>");
     process.exit(1);
   }
 
   const rootDir = path.resolve(rootArg);
-  if (!fs.existsSync(rootDir)) {
-    console.error("Root directory does not exist: " + rootDir);
-    process.exit(1);
-  }
-
-  const stat = fs.statSync(rootDir);
-  if (!stat.isDirectory()) {
-    console.error("Root path is not a directory: " + rootDir);
-    process.exit(1);
-  }
+  validateRootDir(rootDir);
 
   const javaFiles = [];
   walkJavaFiles(rootDir, javaFiles);
 
   const out = [];
-
-  let totalFiles = 0;
-  let matchedFiles = 0;
-  let totalBlocks = 0;
+  const stats = {
+    totalFiles: 0,
+    matchedFiles: 0,
+    totalBlocks: 0,
+    totalSqlBytes: 0,
+    maxSqlBytes: 0,
+    clobChunkedBlocks: 0,
+    skippedReadErrors: 0,
+  };
 
   for (const filePath of javaFiles) {
-    totalFiles++;
+    stats.totalFiles++;
 
     let content;
     try {
       content = fs.readFileSync(filePath, "utf8");
     } catch (e) {
+      stats.skippedReadErrors++;
       console.error("[WARN] Failed to read file: " + filePath);
       console.error("       " + String(e && e.message ? e.message : e));
       continue;
@@ -52,20 +50,30 @@ function main() {
       continue;
     }
 
-    matchedFiles++;
+    stats.matchedFiles++;
+
     if (result.blocks.length === 0) {
       continue;
     }
 
     const relPath = toPosixPath(path.relative(rootDir, filePath));
-    let blockNo = 0;
 
-    for (const blockLines of result.blocks) {
-      blockNo++;
-      totalBlocks++;
-
+    for (let i = 0; i < result.blocks.length; i++) {
+      const blockNo = i + 1;
+      const blockLines = result.blocks[i];
       const sqlText = blockLines.join("\n");
-      const q = makeOracleQQuote(sqlText);
+      const sqlBytes = Buffer.byteLength(sqlText, "utf8");
+
+      stats.totalBlocks++;
+      stats.totalSqlBytes += sqlBytes;
+      if (sqlBytes > stats.maxSqlBytes) {
+        stats.maxSqlBytes = sqlBytes;
+      }
+
+      const clobExprInfo = makeOracleClobExpression(sqlText);
+      if (clobExprInfo.chunkCount > 1) {
+        stats.clobChunkedBlocks++;
+      }
 
       out.push(
         "INSERT INTO " +
@@ -74,7 +82,7 @@ function main() {
       );
       out.push("  '" + escapeOracleString(relPath) + "',");
       out.push("  " + blockNo + ",");
-      out.push("  " + q);
+      out.push(indentMultiline(clobExprInfo.expr, "  "));
       out.push(");");
       out.push("");
     }
@@ -86,11 +94,28 @@ function main() {
   fs.writeFileSync(OUTPUT_FILE, out.join("\n"), "utf8");
 
   console.log("Done.");
-  console.log("Root       : " + rootDir);
-  console.log("Java files  : " + totalFiles);
-  console.log("Matched files (has prepareStatement): " + matchedFiles);
-  console.log("Blocks      : " + totalBlocks);
-  console.log("Output      : " + path.resolve(OUTPUT_FILE));
+  console.log("Root                : " + rootDir);
+  console.log("Java files          : " + stats.totalFiles);
+  console.log("Matched files       : " + stats.matchedFiles);
+  console.log("Blocks              : " + stats.totalBlocks);
+  console.log("Chunked CLOB blocks : " + stats.clobChunkedBlocks);
+  console.log("Total SQL bytes     : " + stats.totalSqlBytes);
+  console.log("Max SQL bytes       : " + stats.maxSqlBytes);
+  console.log("Read errors         : " + stats.skippedReadErrors);
+  console.log("Output              : " + path.resolve(OUTPUT_FILE));
+}
+
+function validateRootDir(rootDir) {
+  if (!fs.existsSync(rootDir)) {
+    console.error("Root directory does not exist: " + rootDir);
+    process.exit(1);
+  }
+
+  const stat = fs.statSync(rootDir);
+  if (!stat.isDirectory()) {
+    console.error("Root path is not a directory: " + rootDir);
+    process.exit(1);
+  }
 }
 
 function walkJavaFiles(dir, result) {
@@ -128,9 +153,9 @@ function extractBlocksFromJava(content) {
   for (const rawLine of lines) {
     const codeLine = stripCommentsAndStrings(rawLine, state);
 
-    const hasPrepare = containsPrepareStatement(codeLine);
-    if (hasPrepare) {
+    if (containsPrepareStatement(codeLine)) {
       hasPrepareStatement = true;
+
       if (appendBuffer.length > 0) {
         blocks.push(appendBuffer.slice());
         appendBuffer = [];
@@ -138,11 +163,16 @@ function extractBlocksFromJava(content) {
       continue;
     }
 
-    if (containsAppendCall(codeLine)) {
-      if (isLikelySqlAppendLine(rawLine, codeLine)) {
-        appendBuffer.push(rawLine);
-      }
+    if (
+      containsAppendCall(codeLine) &&
+      isLikelySqlAppendLine(rawLine, codeLine)
+    ) {
+      appendBuffer.push(rawLine);
     }
+  }
+
+  if (appendBuffer.length > 0) {
+    blocks.push(appendBuffer.slice());
   }
 
   return {
@@ -270,7 +300,6 @@ function containsAppendCall(codeLine) {
 
 function isLikelySqlAppendLine(rawLine, codeLine) {
   const receiver = extractAppendReceiver(codeLine);
-  const rawLower = rawLine.toLowerCase();
   const receiverLower = receiver.toLowerCase();
 
   if (
@@ -321,6 +350,59 @@ function escapeOracleString(s) {
   return s.replace(/'/g, "''");
 }
 
+function makeOracleClobExpression(text) {
+  if (text.length === 0) {
+    return {
+      expr: "EMPTY_CLOB()",
+      chunkCount: 0,
+    };
+  }
+
+  const chunks = splitTextByUtf8Bytes(text, ORACLE_LITERAL_SAFE_BYTES);
+  const parts = [];
+
+  for (let i = 0; i < chunks.length; i++) {
+    const q = makeOracleQQuote(chunks[i]);
+
+    if (i === 0) {
+      parts.push("TO_CLOB(" + q + ")");
+    } else {
+      parts.push("|| " + q);
+    }
+  }
+
+  return {
+    expr: parts.join("\n"),
+    chunkCount: chunks.length,
+  };
+}
+
+function splitTextByUtf8Bytes(text, maxBytes) {
+  const result = [];
+  let current = "";
+  let currentBytes = 0;
+
+  for (const ch of text) {
+    const b = Buffer.byteLength(ch, "utf8");
+
+    if (currentBytes > 0 && currentBytes + b > maxBytes) {
+      result.push(current);
+      current = ch;
+      currentBytes = b;
+      continue;
+    }
+
+    current += ch;
+    currentBytes += b;
+  }
+
+  if (current.length > 0) {
+    result.push(current);
+  }
+
+  return result;
+}
+
 function makeOracleQQuote(text) {
   const candidates = [
     ["[", "]"],
@@ -359,6 +441,13 @@ function makeOracleQQuote(text) {
   }
 
   throw new Error("Failed to choose Oracle q-quote delimiter.");
+}
+
+function indentMultiline(text, indent) {
+  return text
+    .split("\n")
+    .map((line) => indent + line)
+    .join("\n");
 }
 
 main();
